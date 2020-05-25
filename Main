@@ -1,0 +1,342 @@
+.dseg
+	CURPOS:
+		.byte 1
+	LINE:
+		.byte 17
+.cseg
+
+jmp reset
+
+.equ DISP_ON		= 0x0F
+.equ E_MODE			= 0x06
+.equ FN_SET			= 0x28 ;4 bit, 2 line, 5x8
+.equ LCD_CLEAR		= 0x01
+.equ BLGT			= 2
+.equ E				= 1 
+.equ RS				= 0 
+.equ N				= 1
+.def Tmp1			= r16
+
+RESET: ;**** Start of system initialization ****
+	; Initialize (Data-)SRAM
+	clr Tmp1
+	ldi YL,0x00 ; RAMEND+1
+	ldi YH,0x08
+	clr ZH
+	ldi ZL,$60 ; set Z-pointer to start of SRAM
+Init_SRAM:
+	st Z+,Tmp1
+	cp ZL,YL ; up to the very end - no stack right now!
+	cpc ZH,YH
+	brlo Init_SRAM
+	clr Tmp1 ; fill RAM & regs with 0x00
+	clr ZH
+	ldi ZL,$00 ; set Z-pointer to 0
+	Init_Regs:
+	st Z+,Tmp1
+	cpi ZL,$1E ; clear regs up to R29
+	brne Init_Regs
+
+START:
+	ldi Tmp1,high(RAMEND)
+	out SPH,Tmp1
+	ldi Tmp1,low(RAMEND)
+	out SPL,Tmp1
+	call LCD_INIT
+	call WAIT
+	call LINE_ERASE
+	call WAIT
+	call EDITOR
+
+EDITOR:
+	call LINE_PRINT
+	lds r16,CURPOS
+	call LCD_COL
+	call KEY_READ ;HÄNGER
+	;gör ngt med tangent
+	cpi r16,1
+	breq SELECT
+	cpi r16,2
+	breq LEFT
+	cpi r16,3
+	breq DOWN
+	cpi r16,4
+	breq UP
+	cpi r16,5
+	breq RIGHT
+	jmp EDITOR
+
+	SELECT: ;1
+		call BACKLIGHT_TOGGLE
+		jmp EDITOR
+	
+	LEFT: ;2
+		lds r16,CURPOS
+		cpi r16,0x00
+		breq EDITOR
+		subi r16,1
+		sts CURPOS,r16
+		jmp EDITOR	
+	DOWN: ;3
+		call GET_CHAR
+		cpi r16,0x20
+		breq STORE_Z
+		cpi r16,0x41
+		breq STORE_SPACE
+		dec r16
+		st Z,r16
+		jmp EDITOR
+	
+	UP: ;4
+		call GET_CHAR
+		cpi r16,0x20
+		breq STORE_A
+		cpi r16,0x5A
+		breq STORE_SPACE
+		inc r16
+		st Z,r16
+		jmp EDITOR
+
+	RIGHT: ;5
+		lds r16,CURPOS
+		cpi r16,0x0F
+		breq EDITOR
+		subi r16,-1
+		sts CURPOS,r16
+		jmp EDITOR
+
+	STORE_A:
+		ldi r16,0x41
+		st Z,r16
+		jmp EDITOR
+
+	STORE_Z:
+		ldi r16,0x5A
+		st Z,r16
+		jmp EDITOR
+
+	STORE_SPACE:
+		ldi r16,0x20
+		st Z,r16
+		jmp EDITOR
+
+GET_CHAR:
+	ldi ZH,HIGH(LINE)
+	ldi ZL,LOW(LINE)
+	lds r16,CURPOS
+	add ZL,r16
+	ld r16,Z
+	ret
+
+LINE_ERASE:
+	ldi XH,HIGH(LINE)
+	ldi XL,LOW(LINE)
+	ldi r17,17 ;line lenght
+	ldi r16,0x20
+	call FILL
+	clr r16
+	st -x,r16
+	ret
+	
+FILL:
+	st x+,r16
+	dec r17
+	brne FILL
+	ret
+
+BACKLIGHT_TOGGLE:
+	in  r16,PORTB
+	ldi r17,4
+	eor r16,r17
+	out PORTB,r16
+	ret
+
+ADC_READ8: ;r16 önskade kanalen , dvs r16=0 för PC0  
+	ldi r16,(1<<REFS0)|(1<<ADLAR)|0	;AVCC REFERENSPÄNNING   , ADLAR 1  	;ADC KANAL 0
+	sts ADMUX,r16
+	ldi r16,(1<<ADEN)|7 ;AD ENABLE 0111
+	sts ADCSRA,r16
+CONVERT:
+	lds r16,ADCSRA
+	ori r16,(1<<ADSC)	 ;AD START CONVERSION
+	sts ADCSRA,r16
+ADC_BUSY:
+	lds r16,ADCSRA
+	sbrc r16,ADSC		;skip if bit in reg clear
+	jmp ADC_BUSY
+	lds r16,ADCH		;0-255 0-5v, 19mv per steg
+	ret
+
+KEY_READ:
+	call KEY
+	tst r16
+	brne KEY_READ	;old key still pressed
+KEY_WAIT_FOR_PRESS:
+	call KEY
+	tst r16
+	breq KEY_WAIT_FOR_PRESS ;no key pressed
+	ret
+
+KEY:
+	call ADC_READ8
+	push r17
+	;5
+	ldi r17,5
+	subi r16,12
+	BRCS KEY_RET
+	;4
+	dec r17
+	subi r16,30
+	BRCS KEY_RET
+	;3
+	dec r17
+	subi r16,38
+	BRCS KEY_RET
+	;2
+	dec r17
+	subi r16,47
+	BRCS KEY_RET
+	;1
+	dec r17
+	subi r16,76
+	BRCS KEY_RET
+	;0
+	dec r17
+
+	KEY_RET:
+		mov r16,r17
+		pop r17
+		ret
+
+LCD_COL:
+	ori r16,0x80
+	call LCD_COMMAND
+	ret
+
+LCD_INIT:
+	call LCD_PORT_INIT
+	call BACKLIGHT_ON
+	call WAIT
+
+	;initiate 4-bit mode
+	ldi r16,$30
+	call LCD_WRITE4
+	call LCD_WRITE4
+	call LCD_WRITE4
+	ldi r16,$20
+	call LCD_WRITE4
+
+	;configure display
+	;function set, 4 bit, 2 line, 5x8font
+	ldi r16,FN_SET
+	call LCD_COMMAND
+
+	;display on, cursor on, cursor blink
+	ldi r16,DISP_ON
+	call LCD_COMMAND
+
+	;clear display
+	ldi r16,LCD_CLEAR
+	call LCD_COMMAND
+
+	;entry mod, incement cursor, no shift
+	ldi r16,E_MODE
+	call LCD_COMMAND
+	ret
+
+LINE_PRINT:
+	push ZH
+	push ZL
+	call LCD_HOME
+	ldi ZH,HIGH(LINE)
+	ldi ZL,LOW(LINE)
+	call LCD_PRINT
+	pop ZL
+	pop ZH
+	ret
+
+LCD_PRINT:
+	LOOP:
+		ld r16,Z+
+		cpi r16,0x00
+		breq END_STRING
+		call LCD_ASCII
+		jmp LOOP
+	END_STRING:
+		ret
+
+LCD_HOME:
+	ldi r16,0x02
+	call LCD_COMMAND
+	ret
+
+LCD_ERASE:
+	ldi r16,0x01
+	call LCD_COMMAND
+	ret
+
+BACKLIGHT_ON:
+	sbi PORTB,BLGT
+	ret
+
+BACKLIGHT_OFF:
+	cbi PORTB,BLGT
+	ret
+
+LCD_WRITE4:
+	sbi PORTB,E
+	out PORTD,r16
+	cbi PORTB,E
+	call WAIT
+	ret
+
+LCD_WRITE8:
+	call LCD_WRITE4
+	swap r16
+	call LCD_WRITE4
+	ret
+
+LCD_ASCII:
+	sbi PORTB,RS
+	call LCD_WRITE8
+	ret
+
+LCD_COMMAND:
+	cbi PORTB,RS
+	call LCD_WRITE8
+	ret
+
+LCD_PORT_INIT:
+	ldi r16,0xFF
+	out DDRB,r16
+	out DDRD,r16	
+	ret
+
+WAIT:
+	ldi r23,5*N
+D1:
+	adiw r24,8
+	brne D1
+	dec r23
+	brne D1
+	ret
+
+TEST_AD:
+	call ADC_READ8
+	call LCD_PRINT_HEX
+	jmp TEST_AD
+
+LCD_PRINT_HEX:
+	call NIB2HEX
+NIB2HEX:
+	swap r16
+	push r16
+	andi r16,0x0f
+	ori r16,0x30
+	cpi r16,':'
+	brlo NOT_AF
+	subi r16,-0x07
+	NOT_AF:
+		call LCD_ASCII
+		pop r16
+		ret
